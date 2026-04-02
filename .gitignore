@@ -5,3 +5,6 @@ __pycache__/
 *.json
 /tmp/
 *.log
+scanner.db
+scanner.db-wal
+scanner.db-shm

@@ -17,6 +17,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 from aiohttp import web
+import db
 
 # === CONFIG ===
 PORT = 8080
@@ -61,6 +62,7 @@ def hackrf_sweep_worker():
         )
         current_line = [(-100.0)] * FREQ_BINS
         last_push = time.time()
+        last_db_save = time.time()
 
         while running and proc.poll() is None:
             line = proc.stdout.readline()
@@ -86,6 +88,10 @@ def hackrf_sweep_worker():
                     with lock:
                         spectrum = current_line[:]
                     data_event.set()
+                    # Save spectrum to DB every 5s
+                    if now - last_db_save > 5:
+                        db.store_spectrum(current_line[:])
+                        last_db_save = now
                     current_line = [(-100.0)] * FREQ_BINS
                     last_push = now
 
@@ -121,6 +127,7 @@ def rtl433_worker(device_id, freq, label):
                 with lock:
                     decoded_msgs.append(msg)
                     stats["decoded"] += 1
+                db.store_decoded(msg)
                 data_event.set()
                 print(f"[{label}] >> {msg.get('model', '?')}")
             except json.JSONDecodeError:
@@ -165,6 +172,7 @@ def power_monitor_worker(device_id, freq, label):
                             "t": time.time(),
                         }
                         stats["power_readings"] += 1
+                    db.store_power(label, freq / 1e6, round(pwr_db, 1), round(peak_db, 1))
                     data_event.set()
                     os.remove(tmpfile)
             except subprocess.TimeoutExpired:
@@ -290,6 +298,15 @@ async def websocket_handler(request):
         },
     }))
 
+    # Send history from DB on connect
+    history = db.get_recent_decoded(50)
+    if history:
+        await ws.send_str(json.dumps({
+            "type": "decoded",
+            "messages": history,
+            "total": db.get_decoded_stats()["total"],
+        }))
+
     # Start sender as background task, read loop handles pings/close
     sender_task = asyncio.create_task(ws_sender(ws))
     try:
@@ -316,7 +333,17 @@ async def api_status(request):
             "power": dict(power_levels),
             "decoded_count": stats["decoded"],
             "uptime": time.time() - start_time,
+            "db_stats": db.get_decoded_stats(),
         })
+
+
+async def api_history(request):
+    """Return decoded message history from DB."""
+    limit = int(request.query.get("limit", "100"))
+    return web.json_response({
+        "messages": db.get_recent_decoded(limit),
+        "stats": db.get_decoded_stats(),
+    })
 
 
 # ─────────────────────────────────────────────────────
@@ -364,6 +391,7 @@ def main():
     app.router.add_get('/', index_handler)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/status', api_status)
+    app.router.add_get('/api/history', api_history)
     app.router.add_static('/static/', STATIC_DIR, show_index=False)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
